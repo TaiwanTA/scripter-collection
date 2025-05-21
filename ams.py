@@ -26,10 +26,40 @@ profiles = dict(
         streams_csv="AMS/streams_sms1.csv",
         origin_ip="220.130.51.197",
     ),
+    sms2=Profile(
+        api_url="http://61.222.163.125:5080/WebRTCAppEE/rest/v2",
+        origin_ip="61.222.163.125",
+        streams_csv="AMS/streams_sms2.csv",
+    ),
     sms3=Profile(
         api_url="http://61.222.163.102:5080/WebRTCAppEE/rest/v2",
         origin_ip="61.222.163.102",
         streams_csv="AMS/streams_sms3.csv",
+    ),
+    sms4=Profile(
+        api_url="http://61.222.163.104:5080/WebRTCAppEE/rest/v2",
+        origin_ip="61.222.163.104",
+        streams_csv="AMS/streams_sms4.csv",
+    ),
+    _7ms1=Profile(
+        api_url="http://220.130.51.248:5080/WebRTCAppEE/rest/v2",
+        origin_ip="220.130.51.248",
+        streams_csv="AMS/streams_7ms1.csv",
+    ),
+    _7ms2=Profile(
+        api_url="http://61.222.163.86:5080/WebRTCAppEE/rest/v2",
+        origin_ip="61.222.163.86",
+        streams_csv="AMS/streams_7ms2.csv",
+    ),
+    _7ms3=Profile(
+        api_url="http://61.222.163.110:5080/WebRTCAppEE/rest/v2",
+        origin_ip="61.222.163.110",
+        streams_csv="AMS/streams_7ms3.csv",
+    ),
+    _7ms4=Profile(
+        api_url="http://61.220.197.203:5080/WebRTCAppEE/rest/v2",
+        origin_ip="61.220.197.203",
+        streams_csv="AMS/streams_7ms4.csv",
     ),
 )
 
@@ -65,7 +95,7 @@ def create_streams():
     建立流
     """
     profile = select_profile()
-    client = httpx.Client(base_url=profile.api_url)
+    client = httpx.Client(base_url=profile.api_url, timeout=60)
 
     offset = 0
     size = 10000
@@ -114,7 +144,7 @@ def start_all_streams():
     某些情況下AMS可能會沒自動開啟拉流, 這可以一次全部啟動
     """
     profile = select_profile()
-    client = httpx.Client(base_url=profile.api_url)
+    client = httpx.Client(base_url=profile.api_url, timeout=60)
 
     offset = 0
     size = 10000
@@ -135,7 +165,7 @@ def stop_all_streams():
     停止全部流
     """
     profile = select_profile()
-    client = httpx.Client(base_url=profile.api_url)
+    client = httpx.Client(base_url=profile.api_url, timeout=60)
 
     offset = 0
     size = 10000
@@ -146,6 +176,27 @@ def stop_all_streams():
     for stream_id in stream_ids:
         print(f"streamId {stream_id} stopping...", end="")
         resp = client.post(f"/broadcasts/{stream_id}/stop")
+        result = typer.style("success", fg=typer.colors.GREEN, bold=True)
+        print(result)
+
+
+@app.command()
+def delete_all_streams():
+    """
+    刪除全部流
+    """
+    profile = select_profile()
+    client = httpx.Client(base_url=profile.api_url, timeout=60)
+
+    offset = 0
+    size = 10000
+    resp = client.get(f"/broadcasts/list/{offset}/{size}")
+    streams = resp.json()
+    stream_ids = {stream["streamId"] for stream in streams}
+
+    for stream_id in stream_ids:
+        print(f"streamId {stream_id} deleting...", end="")
+        resp = client.delete(f"/broadcasts/{stream_id}")
         result = typer.style("success", fg=typer.colors.GREEN, bold=True)
         print(result)
 
