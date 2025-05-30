@@ -66,7 +66,7 @@ profiles = dict(
 
 def generate_stream_id(name: str, secret_key: str = "ams") -> str:
     h = hmac.new(secret_key.encode(), name.encode(), hashlib.md5)
-    return f"{name}_{h.hexdigest()}"
+    return f"{name}{h.hexdigest()}"
 
 
 def select_profile() -> Profile:
