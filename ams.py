@@ -90,10 +90,29 @@ def select_profile() -> Profile:
 
 
 @app.command()
-def create_streams():
+def create_streams(
+    stream_type: str = typer.Option(
+        "ipcam",
+        "--type",
+        help="串流類型: 'ipcam' 使用 IP Camera 模式 (支援 ONVIF), 'source' 使用 RTSP 串流源模式"
+    )
+):
     """
     建立流
+    
+    支援兩種串流類型:
+    - ipcam: IP Camera 模式 (預設),支援 ONVIF 自動發現
+    - source: RTSP 串流源模式,使用完整 RTSP URL
+    
+    範例:
+      uv run ams.py create-streams                 # 使用 IP Camera 模式
+      uv run ams.py create-streams --type source   # 使用串流源模式
     """
+    # 驗證 stream_type
+    if stream_type not in ["ipcam", "source"]:
+        print(f"錯誤: --type 必須是 'ipcam' 或 'source',收到: '{stream_type}'")
+        raise typer.Exit(1)
+    
     profile = select_profile()
     client = httpx.Client(base_url=profile.api_url, timeout=60)
 
@@ -107,33 +126,50 @@ def create_streams():
         reader = csv.DictReader(csvfile)
         for row in reader:
             stream_id = generate_stream_id(row["code"])
-            stream_url = ""
-            if row["stream_ip"].lower().startswith("rtsp://"):
-                stream_url = row["stream_ip"]
-            else:
-                stream_username = row["stream_username"]
-                stream_password = row["stream_password"]
-                stream_url = f"rtsp://{stream_username}:{stream_password}@{row['stream_ip']}/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif"
-
-            payload = {
-                "streamId": stream_id,
-                "name": row["code"],
-                "description": row.get("description", ""),
-                "type": "streamSource",
-                "streamUrl": stream_url,
-                "originAdress": row.get("originAdress", profile.origin_ip),
-                "webRTCViewerLimit": 20,
-                "metaData": row.get("metaData", ""),
-            }
+            
+            if stream_type == "ipcam":
+                # IP Camera 模式: type="ipCamera"
+                # 根據 Swagger 定義,需要 ipAddr, username, password
+                payload = {
+                    "streamId": stream_id,
+                    "name": row["code"],
+                    "description": row.get("description", ""),
+                    "type": "ipCamera",
+                    "ipAddr": row["stream_ip"],
+                    "username": row.get("stream_username", ""),
+                    "password": row.get("stream_password", ""),
+                    "originAdress": row.get("originAdress", profile.origin_ip),
+                    "webRTCViewerLimit": 10,
+                    "metaData": row.get("metaData", ""),
+                }
+            else:  # stream_type == "source"
+                # 串流源模式: type="streamSource"
+                # 根據 Swagger 定義,需要 streamUrl
+                if row["stream_ip"].lower().startswith("rtsp://"):
+                    stream_url = row["stream_ip"]
+                else:
+                    stream_username = row.get("stream_username", "")
+                    stream_password = row.get("stream_password", "")
+                    stream_url = f"rtsp://{stream_username}:{stream_password}@{row['stream_ip']}/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif"
+                
+                payload = {
+                    "streamId": stream_id,
+                    "name": row["code"],
+                    "description": row.get("description", ""),
+                    "type": "streamSource",
+                    "streamUrl": stream_url,
+                    "originAdress": row.get("originAdress", profile.origin_ip),
+                    "webRTCViewerLimit": 10,
+                    "metaData": row.get("metaData", ""),
+                }
 
             if stream_id in stream_ids:
                 print(f"streamId {stream_id} already exists, skipping...")
                 continue
-
             else:
-                print(f"streamId {stream_id} does not exist, creating...", end="")
+                type_display = "ipCamera" if stream_type == "ipcam" else "streamSource"
+                print(f"streamId {stream_id} (type={type_display}) creating...", end="")
                 resp = client.post("/broadcasts/create?autoStart=true", json=payload)
-
                 result = typer.style("success", fg=typer.colors.GREEN, bold=True)
                 print(result)
 
