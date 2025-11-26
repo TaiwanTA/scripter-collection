@@ -4,6 +4,7 @@
 
 import csv
 from dataclasses import dataclass
+from collections import Counter
 import httpx
 import typer
 import hashlib
@@ -69,172 +70,214 @@ def generate_stream_id(name: str, secret_key: str = "ams") -> str:
     return f"{name}{h.hexdigest()}"
 
 
+def print_result(success: bool, msg: str = ""):
+    """印出成功或失敗訊息"""
+    if success:
+        print(typer.style("success", fg=typer.colors.GREEN, bold=True))
+    else:
+        print(typer.style(f"failed: {msg}", fg=typer.colors.RED, bold=True))
+
+
+def check_result_response(resp: httpx.Response) -> tuple[bool, str]:
+    """檢查返回 Result 物件的 API 回應"""
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}"
+    data = resp.json()
+    if data.get("success"):
+        return True, ""
+    return False, data.get("message", "Unknown error")
+
+
+def check_broadcast_response(resp: httpx.Response) -> tuple[bool, str]:
+    """檢查返回 Broadcast 物件的 API 回應"""
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}"
+    data = resp.json()
+    if data.get("streamId"):
+        return True, ""
+    return False, data.get("message", "Unknown error")
+
+
 def select_profile() -> Profile:
-    rprint("Profiles:", [key for key in profiles.keys()])
-    profile = None
+    rprint("Profiles:", list(profiles.keys()))
     while True:
-        selected = str(typer.prompt("使用profile")).strip()
-        profile = profiles.get(selected)
-        if profile:
+        selected = typer.prompt("使用profile").strip()
+        if profile := profiles.get(selected):
             break
         print(f"Profile '{selected}' not found.")
 
     print(f"--- profile: {selected} ---")
     rprint(profile.__dict__)
     print("---")
-    typer.confirm(
-        "請確認以上資料正確無誤, 確認執行?",
-        abort=True,
-    )
+    typer.confirm("請確認以上資料正確無誤, 確認執行?", abort=True)
     return profile
+
+
+def get_client_and_streams(profile: Profile) -> tuple[httpx.Client, list[dict]]:
+    """取得 HTTP client 和所有串流列表"""
+    client = httpx.Client(base_url=profile.api_url, timeout=60)
+    resp = client.get("/broadcasts/list/0/10000")
+    return client, resp.json()
 
 
 @app.command()
 def create_streams(
     stream_type: str = typer.Option(
-        "ipcam",
-        "--type",
-        help="串流類型: 'ipcam' 使用 IP Camera 模式 (支援 ONVIF), 'source' 使用 RTSP 串流源模式"
+        "ipcam", "--type",
+        help="串流類型: 'ipcam' (IP Camera) 或 'source' (RTSP 串流源)"
     )
 ):
-    """
-    建立流
-    
-    支援兩種串流類型:
-    - ipcam: IP Camera 模式 (預設),支援 ONVIF 自動發現
-    - source: RTSP 串流源模式,使用完整 RTSP URL
-    
-    範例:
-      uv run ams.py create-streams                 # 使用 IP Camera 模式
-      uv run ams.py create-streams --type source   # 使用串流源模式
-    """
-    # 驗證 stream_type
+    """建立流 (ipcam: IP Camera 模式, source: RTSP 串流源模式)"""
     if stream_type not in ["ipcam", "source"]:
-        print(f"錯誤: --type 必須是 'ipcam' 或 'source',收到: '{stream_type}'")
-        raise typer.Exit(1)
-    
-    profile = select_profile()
-    client = httpx.Client(base_url=profile.api_url, timeout=60)
+        raise typer.Exit(f"錯誤: --type 必須是 'ipcam' 或 'source'")
 
-    offset = 0
-    size = 10000
-    resp = client.get(f"/broadcasts/list/{offset}/{size}")
-    streams = resp.json()
-    stream_ids = {stream["streamId"] for stream in streams}
+    profile = select_profile()
+    client, streams = get_client_and_streams(profile)
+    existing_ids = {s["streamId"] for s in streams}
 
     with open(profile.streams_csv, newline="") as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
+        for row in csv.DictReader(csvfile):
             stream_id = generate_stream_id(row["code"])
-            
+
+            if stream_id in existing_ids:
+                print(f"streamId {stream_id} already exists, skipping...")
+                continue
+
+            # 建立 payload
+            payload = {
+                "streamId": stream_id,
+                "name": row["code"],
+                "description": row.get("description", ""),
+                "originAdress": row.get("originAdress", profile.origin_ip),
+                "webRTCViewerLimit": 10,
+                "metaData": row.get("metaData", ""),
+            }
+
             if stream_type == "ipcam":
-                # IP Camera 模式: type="ipCamera"
-                # 根據 Swagger 定義,需要 ipAddr, username, password
-                payload = {
-                    "streamId": stream_id,
-                    "name": row["code"],
-                    "description": row.get("description", ""),
+                payload.update({
                     "type": "ipCamera",
                     "ipAddr": row["stream_ip"],
                     "username": row.get("stream_username", ""),
                     "password": row.get("stream_password", ""),
-                    "originAdress": row.get("originAdress", profile.origin_ip),
-                    "webRTCViewerLimit": 10,
-                    "metaData": row.get("metaData", ""),
-                }
-            else:  # stream_type == "source"
-                # 串流源模式: type="streamSource"
-                # 根據 Swagger 定義,需要 streamUrl
-                if row["stream_ip"].lower().startswith("rtsp://"):
-                    stream_url = row["stream_ip"]
-                else:
-                    stream_username = row.get("stream_username", "")
-                    stream_password = row.get("stream_password", "")
-                    stream_url = f"rtsp://{stream_username}:{stream_password}@{row['stream_ip']}/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif"
-                
-                payload = {
-                    "streamId": stream_id,
-                    "name": row["code"],
-                    "description": row.get("description", ""),
-                    "type": "streamSource",
-                    "streamUrl": stream_url,
-                    "originAdress": row.get("originAdress", profile.origin_ip),
-                    "webRTCViewerLimit": 10,
-                    "metaData": row.get("metaData", ""),
-                }
-
-            if stream_id in stream_ids:
-                print(f"streamId {stream_id} already exists, skipping...")
-                continue
+                })
             else:
-                type_display = "ipCamera" if stream_type == "ipcam" else "streamSource"
-                print(f"streamId {stream_id} (type={type_display}) creating...", end="")
-                resp = client.post("/broadcasts/create?autoStart=true", json=payload)
-                result = typer.style("success", fg=typer.colors.GREEN, bold=True)
-                print(result)
+                stream_url = row["stream_ip"] if row["stream_ip"].lower().startswith("rtsp://") else \
+                    f"rtsp://{row.get('stream_username', '')}:{row.get('stream_password', '')}@{row['stream_ip']}/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif"
+                payload.update({"type": "streamSource", "streamUrl": stream_url})
+
+            print(f"streamId {stream_id} (type={payload['type']}) creating...", end="")
+            resp = client.post("/broadcasts/create?autoStart=true", json=payload)
+            success, msg = check_broadcast_response(resp)
+            print_result(success, msg)
 
 
 @app.command()
 def start_all_streams():
-    """
-    某些情況下AMS可能會沒自動開啟拉流, 這可以一次全部啟動
-    """
+    """啟動所有串流"""
     profile = select_profile()
-    client = httpx.Client(base_url=profile.api_url, timeout=60)
+    client, streams = get_client_and_streams(profile)
 
-    offset = 0
-    size = 10000
-    resp = client.get(f"/broadcasts/list/{offset}/{size}")
-    streams = resp.json()
-    stream_ids = {stream["streamId"] for stream in streams}
-
-    for stream_id in stream_ids:
+    for stream in streams:
+        stream_id = stream["streamId"]
         print(f"streamId {stream_id} starting...", end="")
         resp = client.post(f"/broadcasts/{stream_id}/start")
-        result = typer.style("success", fg=typer.colors.GREEN, bold=True)
-        print(result)
+        success, msg = check_result_response(resp)
+        print_result(success, msg)
 
 
 @app.command()
 def stop_all_streams():
-    """
-    停止全部流
-    """
+    """停止所有串流"""
     profile = select_profile()
-    client = httpx.Client(base_url=profile.api_url, timeout=60)
+    client, streams = get_client_and_streams(profile)
 
-    offset = 0
-    size = 10000
-    resp = client.get(f"/broadcasts/list/{offset}/{size}")
-    streams = resp.json()
-    stream_ids = {stream["streamId"] for stream in streams}
-
-    for stream_id in stream_ids:
+    for stream in streams:
+        stream_id = stream["streamId"]
         print(f"streamId {stream_id} stopping...", end="")
         resp = client.post(f"/broadcasts/{stream_id}/stop")
-        result = typer.style("success", fg=typer.colors.GREEN, bold=True)
-        print(result)
+        success, msg = check_result_response(resp)
+        print_result(success, msg)
 
 
 @app.command()
 def delete_all_streams():
-    """
-    刪除全部流
-    """
+    """刪除所有串流"""
+    profile = select_profile()
+    client, streams = get_client_and_streams(profile)
+
+    for stream in streams:
+        stream_id = stream["streamId"]
+        print(f"streamId {stream_id} deleting...", end="")
+        resp = client.delete(f"/broadcasts/{stream_id}")
+        success, msg = check_broadcast_response(resp)
+        print_result(success, msg)
+
+
+@app.command()
+def query():
+    """查詢伺服器上的串流狀態"""
+    profile = select_profile()
+    client, streams = get_client_and_streams(profile)
+
+    # 伺服器資訊
+    if (resp := client.get("/version")).status_code == 200:
+        v = resp.json()
+        print(f"\n版本: {v.get('versionName')} ({v.get('versionType')}) Build: {v.get('buildNumber')}")
+
+    # 統計
+    if (resp := client.get("/broadcasts/active-live-stream-count")).status_code == 200:
+        print(f"活躍直播: {resp.json().get('number', 0)} / 總計: {len(streams)}")
+
+    if not streams:
+        print("目前沒有任何串流")
+        return
+
+    # 狀態統計
+    print(f"狀態: {dict(Counter(s.get('status', 'unknown') for s in streams))}")
+    print(f"類型: {dict(Counter(s.get('type', 'unknown') for s in streams))}")
+
+    # 串流列表
+    print(f"\n{'streamId':<50} {'name':<20} {'type':<15} {'status':<15}")
+    print("-" * 100)
+    status_colors = {"broadcasting": typer.colors.GREEN, "created": typer.colors.YELLOW}
+    for s in streams:
+        status = s.get("status", "N/A")
+        color = status_colors.get(status, typer.colors.RED if status in ["finished", "failed", "error"] else None)
+        status_display = typer.style(status, fg=color) if color else status
+        print(f"{s.get('streamId', 'N/A'):<50} {s.get('name', 'N/A'):<20} {s.get('type', 'N/A'):<15} {status_display:<15}")
+
+
+@app.command()
+def query_stream(stream_id: str = typer.Argument(..., help="要查詢的串流 ID")):
+    """查詢單一串流的詳細資訊"""
     profile = select_profile()
     client = httpx.Client(base_url=profile.api_url, timeout=60)
 
-    offset = 0
-    size = 10000
-    resp = client.get(f"/broadcasts/list/{offset}/{size}")
-    streams = resp.json()
-    stream_ids = {stream["streamId"] for stream in streams}
+    resp = client.get(f"/broadcasts/{stream_id}")
+    if resp.status_code == 404:
+        print(f"串流 {stream_id} 不存在")
+        return
+    if resp.status_code != 200:
+        print(f"查詢失敗: HTTP {resp.status_code}")
+        return
 
-    for stream_id in stream_ids:
-        print(f"streamId {stream_id} deleting...", end="")
-        resp = client.delete(f"/broadcasts/{stream_id}")
-        result = typer.style("success", fg=typer.colors.GREEN, bold=True)
-        print(result)
+    stream = resp.json()
+    rprint("\n--- 串流詳細資訊 ---", stream)
+
+    # 觀看統計
+    if (stats_resp := client.get(f"/broadcasts/{stream_id}/broadcast-statistics")).status_code == 200:
+        stats = stats_resp.json()
+        print(f"\n觀眾: HLS={stats.get('totalHLSWatchersCount', 0)} WebRTC={stats.get('totalWebRTCWatchersCount', 0)} "
+              f"RTMP={stats.get('totalRTMPWatchersCount', 0)} DASH={stats.get('totalDASHWatchersCount', 0)}")
+
+    # IP Camera 錯誤檢查
+    if stream.get("type") in ["ipCamera", "streamSource"]:
+        if (err_resp := client.get(f"/broadcasts/{stream_id}/ip-camera-error")).status_code == 200:
+            err = err_resp.json()
+            if err.get("success"):
+                print(typer.style(f"錯誤: {err.get('message', 'N/A')}", fg=typer.colors.RED))
+            else:
+                print(typer.style("無錯誤", fg=typer.colors.GREEN))
 
 
 if __name__ == "__main__":
