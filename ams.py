@@ -114,10 +114,26 @@ def select_profile() -> Profile:
 
 
 def get_client_and_streams(profile: Profile) -> tuple[httpx.Client, list[dict]]:
-    """取得 HTTP client 和所有串流列表"""
+    """取得 HTTP client 和所有串流列表 (支援分頁)"""
     client = httpx.Client(base_url=profile.api_url, timeout=60)
-    resp = client.get("/broadcasts/list/0/10000")
-    return client, resp.json()
+    try:
+        all_streams: list[dict] = []
+        offset = 0
+        size = 1000  # 每次獲取 1000 筆
+        while True:
+            resp = client.get(f"/broadcasts/list/{offset}/{size}")
+            resp.raise_for_status()  # 針對 4xx/5xx 回應拋出例外
+            batch = resp.json()
+            if not batch:
+                break
+            all_streams.extend(batch)
+            if len(batch) < size:
+                break
+            offset += size
+        return client, all_streams
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        print(typer.style(f"無法獲取串流列表: {e}", fg=typer.colors.RED, bold=True))
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -161,8 +177,13 @@ def create_streams(
                     "password": row.get("stream_password", ""),
                 })
             else:
-                stream_url = row["stream_ip"] if row["stream_ip"].lower().startswith("rtsp://") else \
-                    f"rtsp://{row.get('stream_username', '')}:{row.get('stream_password', '')}@{row['stream_ip']}/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif"
+                if row["stream_ip"].lower().startswith("rtsp://"):
+                    stream_url = row["stream_ip"]
+                else:
+                    stream_url = (
+                        f"rtsp://{row.get('stream_username', '')}:{row.get('stream_password', '')}"
+                        f"@{row['stream_ip']}/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif"
+                    )
                 payload.update({"type": "streamSource", "streamUrl": stream_url})
 
             print(f"streamId {stream_id} (type={payload['type']}) creating...", end="")
@@ -219,14 +240,19 @@ def query():
     profile = select_profile()
     client, streams = get_client_and_streams(profile)
 
-    # 伺服器資訊
-    if (resp := client.get("/version")).status_code == 200:
-        v = resp.json()
-        print(f"\n版本: {v.get('versionName')} ({v.get('versionType')}) Build: {v.get('buildNumber')}")
+    try:
+        # 伺服器資訊
+        resp = client.get("/version")
+        if resp.status_code == 200:
+            v = resp.json()
+            print(f"\n版本: {v.get('versionName')} ({v.get('versionType')}) Build: {v.get('buildNumber')}")
 
-    # 統計
-    if (resp := client.get("/broadcasts/active-live-stream-count")).status_code == 200:
-        print(f"活躍直播: {resp.json().get('number', 0)} / 總計: {len(streams)}")
+        # 統計
+        resp = client.get("/broadcasts/active-live-stream-count")
+        if resp.status_code == 200:
+            print(f"活躍直播: {resp.json().get('number', 0)} / 總計: {len(streams)}")
+    except httpx.RequestError as e:
+        print(typer.style(f"獲取伺服器資訊失敗: {e}", fg=typer.colors.YELLOW))
 
     if not streams:
         print("目前沒有任何串流")
@@ -239,10 +265,16 @@ def query():
     # 串流列表
     print(f"\n{'streamId':<50} {'name':<20} {'type':<15} {'status':<15}")
     print("-" * 100)
-    status_colors = {"broadcasting": typer.colors.GREEN, "created": typer.colors.YELLOW}
+    status_colors = {
+        "broadcasting": typer.colors.GREEN,
+        "created": typer.colors.YELLOW,
+        "finished": typer.colors.RED,
+        "failed": typer.colors.RED,
+        "error": typer.colors.RED,
+    }
     for s in streams:
         status = s.get("status", "N/A")
-        color = status_colors.get(status, typer.colors.RED if status in ["finished", "failed", "error"] else None)
+        color = status_colors.get(status)
         status_display = typer.style(status, fg=color) if color else status
         print(f"{s.get('streamId', 'N/A'):<50} {s.get('name', 'N/A'):<20} {s.get('type', 'N/A'):<15} {status_display:<15}")
 
@@ -253,31 +285,38 @@ def query_stream(stream_id: str = typer.Argument(..., help="要查詢的串流 I
     profile = select_profile()
     client = httpx.Client(base_url=profile.api_url, timeout=60)
 
-    resp = client.get(f"/broadcasts/{stream_id}")
-    if resp.status_code == 404:
-        print(f"串流 {stream_id} 不存在")
-        return
-    if resp.status_code != 200:
-        print(f"查詢失敗: HTTP {resp.status_code}")
-        return
+    try:
+        resp = client.get(f"/broadcasts/{stream_id}")
+        if resp.status_code == 404:
+            print(f"串流 {stream_id} 不存在")
+            return
+        if resp.status_code != 200:
+            print(f"查詢失敗: HTTP {resp.status_code}")
+            return
 
-    stream = resp.json()
-    rprint("\n--- 串流詳細資訊 ---", stream)
+        stream = resp.json()
+        rprint("\n--- 串流詳細資訊 ---", stream)
 
-    # 觀看統計
-    if (stats_resp := client.get(f"/broadcasts/{stream_id}/broadcast-statistics")).status_code == 200:
-        stats = stats_resp.json()
-        print(f"\n觀眾: HLS={stats.get('totalHLSWatchersCount', 0)} WebRTC={stats.get('totalWebRTCWatchersCount', 0)} "
-              f"RTMP={stats.get('totalRTMPWatchersCount', 0)} DASH={stats.get('totalDASHWatchersCount', 0)}")
+        # 觀看統計
+        stats_resp = client.get(f"/broadcasts/{stream_id}/broadcast-statistics")
+        if stats_resp.status_code == 200:
+            stats = stats_resp.json()
+            print(f"\n觀眾: HLS={stats.get('totalHLSWatchersCount', 0)} WebRTC={stats.get('totalWebRTCWatchersCount', 0)} "
+                  f"RTMP={stats.get('totalRTMPWatchersCount', 0)} DASH={stats.get('totalDASHWatchersCount', 0)}")
 
-    # IP Camera 錯誤檢查
-    if stream.get("type") in ["ipCamera", "streamSource"]:
-        if (err_resp := client.get(f"/broadcasts/{stream_id}/ip-camera-error")).status_code == 200:
-            err = err_resp.json()
-            if err.get("success"):
-                print(typer.style(f"錯誤: {err.get('message', 'N/A')}", fg=typer.colors.RED))
-            else:
-                print(typer.style("無錯誤", fg=typer.colors.GREEN))
+        # IP Camera 錯誤檢查
+        if stream.get("type") in ["ipCamera", "streamSource"]:
+            err_resp = client.get(f"/broadcasts/{stream_id}/ip-camera-error")
+            if err_resp.status_code == 200:
+                err = err_resp.json()
+                # 注意: /ip-camera-error API 的回應中, 'success' 為 true 表示「成功獲取到錯誤訊息」,
+                # 亦即串流本身有錯誤。這與其他 API 的 'success' 欄位含義相反。
+                if err.get("success"):
+                    print(typer.style(f"錯誤: {err.get('message', 'N/A')}", fg=typer.colors.RED))
+                else:
+                    print(typer.style("無錯誤", fg=typer.colors.GREEN))
+    except httpx.RequestError as e:
+        print(typer.style(f"網路請求失敗: {e}", fg=typer.colors.RED, bold=True))
 
 
 if __name__ == "__main__":
